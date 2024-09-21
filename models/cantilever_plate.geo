@@ -11,4 +11,4 @@ Curve Loop(1) = {4, 1, 2, 3};
 
 Plane Surface(1) = {1};
 Transfinite Surface {1};
-Transfinite Curve {2, 1, 4, 3} = 8 Using Progression 1;
+Transfinite Curve {2, 1, 4, 3} = 31 Using Progression 1;

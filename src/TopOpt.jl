@@ -5,13 +5,14 @@ using Ferrite: nnodes_per_cell
 using Tensors, SparseArrays, LinearAlgebra
 using ForwardDiff
 
+using Nonconvex, NonconvexMMA
+Nonconvex.@load MMA
+
 export StressLimits, Isotropic2D, Orthotropic2D
 export NodalLoad, LinearLoad
 export FEModel, OptimOpts
-export fea, topopt
 export get_centers
-
-export global_stiffness, global_force
+export topopt
 
 struct StressLimits
     Xt
@@ -21,7 +22,7 @@ struct StressLimits
     Sln
     Stn
 end
-StressLimits() = StressLimits(0, 0, 0, 0, 0, 0)
+StressLimits() = StressLimits(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 struct Material{dim}
     C::SymmetricTensor{4,dim}
@@ -68,7 +69,7 @@ struct FEModel{dim}
     ch::ConstraintHandler
 end
 
-function FEModel(mat::Material{dim}, grid::Grid, ip::Interpolation, qr::QuadratureRule{dim,shape}, constraints::Vector{Dirichlet}, loads::Vector{<:Load}) where {dim,shape}
+function FEModel(; mat::Material{dim}, grid::Grid, ip::Interpolation, qr::QuadratureRule{dim,shape}, constraints::Vector{Dirichlet}, loads::Vector{<:Load}) where {dim,shape}
     # element type and quadrature rule
     cellvalues = CellVectorValues(qr, ip)
 
@@ -104,162 +105,170 @@ struct OptimOpts
     maxiter::Integer
     volfrac::Real
     p::Real
-    rmin::Real
-    move::Real
+    rρ::Real
+    rθ::Real
+    reltol::Real
 end
 
-function topopt(model::FEModel, opts::OptimOpts)
-    x = Dict(
-        :ρ => fill(opts.volfrac, getncells(model.grid)),
-        :θ => zeros(getncells(model.grid))
-    )
+function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
+    Hρ = convolution_filter(opts.rρ, model)
+    Hθ = convolution_filter(opts.rθ, model)
+    f = global_force(model)
 
-    H = convolution_filter(opts.rmin, model)
+    # preallocate stifness and sensitivities
+    n_basefuncs = getnbasefunctions(model.cellvalues)
+    K = create_sparsity_pattern(model.dh)
+    ∂Ke∂x = fill(zeros(n_basefuncs, n_basefuncs), 2 * getncells(model.grid))
 
-    # history
-    c_hist = []
-    FS_hist = []
-    mode_hist = []
+    # preallocate solution
+    u = zeros(dim * getnnodes(model.grid))
 
-    # final result only
-    u, σ, IFm, IFf = 0, 0, 0, 0
-    for _ in 1:opts.maxiter
-        (c, ∂c∂x), (u, σ), (FS, mode, IFm, IFf) = fea(x, opts.p, model)
-        push!(c_hist, c)
-        push!(FS_hist, FS)
-        push!(mode_hist, mode)
+    # objective function/sensitivities
+    ∂c∂θ_prev = zeros(getncells(model.grid))
+    function obj(x::AbstractVector)
+        # regularise orientations
+        H = x[1:2:end]' .* Hθ # scale columns by density
+        H ./= sum(H, dims=2) # renormalize
+        x[2:2:end] .= Hθ * x[2:2:end] # apply filter
 
-        # apply filter and update design variables
-        ∂c∂x[:ρ] .= H * (x[:ρ] .* ∂c∂x[:ρ]) ./ x[:ρ]
-        update_x!(x, ∂c∂x, σ, model, opts)
+        # assemble linear system
+        global_stiffness!(K, ∂Ke∂x, x, opts.p, model)
+        apply!(K, f, model.ch)
+
+        # solve
+        u .= K \ f
+        c = u' * K * u
+        return c
     end
-    return c_hist, x, u, σ, FS_hist, mode_hist, IFm, IFf
-end
-
-function fea(x::Dict{Symbol,<:Vector{<:Real}}, p::Real, model::FEModel{dim}) where {dim}
-    # assemble linear system
-    K, ∂Ke∂x = global_stiffness(x, p, model)
-    f = global_force(model) # TODO not necessary to rebuild in every iteration
-    apply!(K, f, model.ch)
-
-    # solve
-    u = K \ f
-
-    # compliance
-    c = u' * K * u
-
-    # sensitivities
-    ∂c∂x = Dict(var => zero(xi) for (var, xi) in x)
-    for cell in CellIterator(model.dh)
-        ue = u[celldofs(cell)]
-        for var in keys(∂c∂x)
-            ∂c∂x[var][cellid(cell)] = -ue' * ∂Ke∂x[var][cellid(cell)] * ue
+    function dobj(x)
+        ∂c∂x = zero(x)
+        for cell in CellIterator(model.dh)
+            ue = u[celldofs(cell)]
+            ∂c∂x[2*cellid(cell)-1] = -ue' * ∂Ke∂x[2*cellid(cell)-1] * ue
+            ∂c∂x[2*cellid(cell)] = -ue' * ∂Ke∂x[2*cellid(cell)] * ue
         end
+
+        # filter densities
+        ∂c∂x[1:2:end] .= Hρ * (x[1:2:end] .* ∂c∂x[1:2:end]) ./ x[1:2:end]
+
+        # regularise orientations
+        # H = x[1:2:end]' .* Hθ # scale columns by density
+        # H ./= sum(H, dims=2) # renormalize
+        # ∂c∂x[2:2:end] .= H * ∂c∂x[2:2:end] # apply filter
+
+        # average orientations
+        # ∂c∂x[2:2:end] .= 0.5 * (∂c∂x[2:2:end] + ∂c∂θ_prev)
+        # ∂c∂θ_prev .= ∂c∂x[2:2:end]
+
+        return ∂c∂x
     end
 
-    # stress - averaged inside element
-    σ = zeros(Tensor{2,dim}, getncells(model.grid))
-    for cell in CellIterator(model.dh)
-        reinit!(model.cellvalues, cell)
-        e = cellid(cell)
-        for q_point in 1:getnquadpoints(model.cellvalues)
-            dΩ = getdetJdV(model.cellvalues, q_point)
-            ϵ = function_symmetric_gradient(model.cellvalues, q_point, u[celldofs(cell)])
-            σ[e] += x[:ρ][e]^p * rotate(model.mat.C, x[:θ][e]) ⊡ ϵ * dΩ
-        end
-        σ[e] /= model.elemvol[e]
+    # volume fraction constraint function/sensitivities
+    function constraint(x)
+        return x[1:2:end] ⋅ model.elemvol / sum(model.elemvol) - opts.volfrac
+    end
+    function dconstraint(x)
+        ∂g∂x = zero(x)
+        ∂g∂x[1:2:end] .= model.elemvol / sum(model.elemvol)
+        return ∂g∂x
     end
 
-    # failure
-    FS = zeros(getncells(model.grid))
-    mode = ["" for _ in 1:getncells(model.grid)]
+    # postprocessing
+    c_hist = Float64[]
+    FS_hist = Float64[]
+    mode_hist = AbstractString[]
     IFm = zeros(getncells(model.grid))
     IFf = zeros(getncells(model.grid))
-    for cell in CellIterator(model.dh)
-        e = cellid(cell)
-        sl, st, slt = tovoigt(rotate(σ[e], -x[:θ][e]))
-        FS[e], mode[e], (IFm[e], IFf[e]) = hashin(σ[e], x[:θ][e], model.mat)
-    end
+    function post(solution; update=false)
+        ρ = solution.x[1:2:end]
+        θ = solution.x[2:2:end]
 
-    crit = argmin(FS)
-    FS = FS[crit]
-    mode = mode[crit]
-
-    return (c, ∂c∂x), (u, σ), (FS, mode, IFm, IFf)
-end
-
-function update_x!(x::Dict{Symbol,<:Vector{<:Real}}, ∂c∂x::Dict{Symbol,<:Vector{<:Real}}, σ, model::FEModel, opts::OptimOpts)
-    # update density
-    ρ = x[:ρ]
-    ∂c∂ρ = ∂c∂x[:ρ]
-    ρnew = zero(x[:ρ])
-
-    λ1, λ2 = 0, 100000
-    while λ2 - λ1 > 1e-4
-        λmid = (λ1 + λ2) / 2
-        @. ρnew = max(1e-3, max(ρ - opts.move, min(ρ * sqrt(-∂c∂ρ / λmid), min(ρ + opts.move, 1))))
-        if ρnew ⋅ model.elemvol - opts.volfrac * sum(model.elemvol) > 0
-            λ1 = λmid
-        else
-            λ2 = λmid
+        # stress - averaged inside element
+        σ = zeros(Tensor{2,dim}, getncells(model.grid))
+        for cell in CellIterator(model.dh)
+            reinit!(model.cellvalues, cell)
+            e = cellid(cell)
+            for q_point in 1:getnquadpoints(model.cellvalues)
+                dΩ = getdetJdV(model.cellvalues, q_point)
+                ϵ = function_symmetric_gradient(model.cellvalues, q_point, u[celldofs(cell)])
+                σ[e] += ρ[e]^opts.p * rotate(model.mat.C, θ[e]) ⊡ ϵ * dΩ
+            end
+            σ[e] /= model.elemvol[e]
         end
+
+        # failure
+        FS = zeros(getncells(model.grid))
+        mode = ["" for _ in 1:getncells(model.grid)]
+        for cell in CellIterator(model.dh)
+            e = cellid(cell)
+            FS[e], mode[e], (IFm[e], IFf[e]) = hashin2d(σ[e], θ[e], model.mat)
+        end
+
+        IFm .*= ρ .^ opts.p
+        IFf .*= ρ .^ opts.p
+        FS .*= ρ .^ opts.p
+
+        crit = argmin(FS)
+        FS = FS[crit]
+        mode = mode[crit]
+
+        push!(c_hist, u' * K * u)
+        push!(FS_hist, FS)
+        push!(mode_hist, mode)
     end
 
-    x[:ρ] .= ρnew
+    optim = Model(CustomGradFunction(obj, dobj))
+    for i = 1:getncells(model.grid)
+        addvar!(optim, 1e-3, 1) # ρ
+        addvar!(optim, -pi, pi) # θ
+    end
+    add_ineq_constraint!(optim, CustomGradFunction(constraint, dconstraint))
 
-    ## update orientation
-    # lim = model.mat.stress_limits
-    # CYc = (lim.Yc / 2lim.Stn)^2 - 1
-    # for cell in CellIterator(model.dh)
-    #     e = cellid(cell)
-    #     principal = eigen(σ[e])
-    #     s1, s2 = sort(abs.(principal.values), rev=true)
-    #     sl, st, slt = tovoigt(rotate(σ[e], -x[:θ][e]))
+    r = optimize(
+        optim,
+        MMA(),
+        begin
+            x0 = zeros(2 * getncells(model.grid))
+            x0[1:2:end] .= opts.volfrac
+            x0[2:2:end] .= deg2rad(0)
+            x0
+        end,
+        options=MMAOptions(
+            maxiter=opts.maxiter,
+            convcriteria=GenericCriteria(),
+            tol=Tolerance(x=0.0, fabs=0.0, frel=opts.reltol),
+        ),
+        callback=post,
+    )
 
-    #     if st > 0
-    #         Qy = lim.Sln^2 * (s1 + s2) / (lim.Sln^2 - lim.Yt^2) / (s1 - s2) # matrix tensile
-    #     else
-    #         Qy = lim.Sln^2 * (4 * CYc * lim.Stn^2 + lim.Yc * (s1 + s2)) / (lim.Yc * (lim.Sln^2 - 4 * lim.Stn^2) * (s1 - s2)) # matrix compressive
-    #     end
-    #     Qy = min(-1, max(Qy, 1))
+    c = r.minimum
+    ρ = r.minimizer[1:2:end]
+    θ = r.minimizer[2:2:end]
 
-    #     idx_max = argmax(abs.(principal.values))
-    #     direction = principal.vectors[:, idx_max]
-    #     x[:θ][e] = atan(direction[2] / direction[1]) + 0.5 * acos(Qy)
-    # end
+    return ρ, θ, c_hist, FS_hist, mode_hist, IFm, IFf
 end
 
-# function global_stiffness(x::Dict{Symbol,<:Vector{<:Real}}, p::Real, model::FEModel)
-function global_stiffness(x, p::Real, model::FEModel)
-    # preallocate global stiffness
-    K = create_sparsity_pattern(model.dh)
+function global_stiffness!(K, ∂Ke∂x, x::AbstractVector, p::Real, model::FEModel)
     assembler = start_assemble(K)
 
     # preallocate elemental stiffness
     n_basefuncs = getnbasefunctions(model.cellvalues)
     Ke = zeros(n_basefuncs, n_basefuncs)
 
-    # Dict{Symbol, Vector{Matrix}}
-    # ∂Ke∂x[design variable][element] is a square matrix of order n_basefuncs with the derivatives of Ke
-    ∂Ke∂x = Dict(var => fill(zeros(n_basefuncs, n_basefuncs), getncells(model.grid)) for var in keys(x))
-
     for cell in CellIterator(model.dh)
         reinit!(model.cellvalues, cell)
 
         e = cellid(cell)
-        xe = [var[e] for var in values(x)]
+        xe = [x[2*e-1], x[2*e]]
 
         # compute Ke and derivatives
         jac = ForwardDiff.jacobian((Ke, xe) -> element_stiffness!(Ke, xe, p, model), Ke, xe)
 
-        for (i, var) in enumerate(keys(∂Ke∂x))
-            ∂Ke∂x[var][e] = reshape(jac[:, i], (n_basefuncs, n_basefuncs))
-        end
+        ∂Ke∂x[2*e-1] = reshape(jac[:, 1], (n_basefuncs, n_basefuncs))
+        ∂Ke∂x[2*e] = reshape(jac[:, 2], (n_basefuncs, n_basefuncs))
 
         assemble!(assembler, celldofs(cell), Ke)
     end
-
-    return K, ∂Ke∂x
 end
 
 function element_stiffness!(Ke::Matrix{T}, xe::Vector{T}, p::Real, model::FEModel) where {T<:Real}
@@ -321,7 +330,7 @@ function global_force(model::FEModel{dim}) where {dim}
     return f
 end
 
-function hashin(σ, θ, mat::Material)
+function hashin2d(σ, θ, mat::Material)
     sl, st, slt = tovoigt(rotate(σ, -θ))
     lim = mat.stress_limits
     CYc = (lim.Yc / 2lim.Stn)^2 - 1
@@ -331,17 +340,17 @@ function hashin(σ, θ, mat::Material)
         modem = "MT"
         IFm = (st / lim.Yt)^2 + (slt / lim.Sln)^2
         FSm = 1 / sqrt(IFm)
+        IFm = 0
     else
         modem = "MC"
 
         # IF = (st/(2*Stn))^2 + Cyc*(st/Yc) + (slt/Sln)^2
         # F^2 * ((st/(2*Stn))^2 + (slt/Sln)^2) + F * CYc*(st/Yc) - 1 = 0
         a = (st / 2lim.Stn)^2 + (slt / lim.Sln)^2
-        b = CYc * st / lim.Yc
-        c = -1
+        b = -CYc * st / lim.Yc
 
         IFm = a + b
-        FSm = (-b + sqrt(b^2 - 4 * a * c)) / 2a
+        FSm = (-b + sqrt(b^2 + 4a)) / 2a
     end
 
     # fiber failure
