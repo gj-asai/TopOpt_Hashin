@@ -1,14 +1,15 @@
 using Ferrite, FerriteGmsh
+
 using FerriteViz, GLMakie
 
-include("TopOpt.jl")
+include("./TopOpt.jl")
 import .TopOpt
 
 # mesh
-grid = togrid("models/mbb.msh")
-addfaceset!(grid, "symmetry", x -> x[1] ≈ 0.0) # left edge
-addnodeset!(grid, "support", x -> x[1] ≈ 168.0 && x[2] ≈ 0.0) # bottom right corner
-addnodeset!(grid, "force", x -> x[1] ≈ 0.0 && x[2] ≈ 80.0) # top left corner
+grid = togrid("models/L.msh")
+addfaceset!(grid, "fix", x -> x[2] ≈ 200.0) # top edge
+addnodeset!(grid, "force", x -> x[1] ≈ 200.0 && x[2] ≈ 50.0) # bottom right corner
+# addfaceset!(grid, "force", x -> x[1] ≈ 200.0) # right edge
 
 # create and solve FE model
 model = TopOpt.FEModel(
@@ -18,15 +19,15 @@ model = TopOpt.FEModel(
     ip=Lagrange{2,RefCube,1}(), # linear elements
     qr=QuadratureRule{2,RefCube}(2), # 2 point quadrature
     constraints=[
-        Dirichlet(:u, getfaceset(grid, "symmetry"), (x, t) -> 0.0, [1]), # block x displacement
-        Dirichlet(:u, getnodeset(grid, "support"), (x, t) -> 0.0, [2]), # block y displacement
+        Dirichlet(:u, getfaceset(grid, "fix"), x -> 0 * x),
     ],
     loads=[
+        # TopOpt.LinearLoad("force", (0.0, -1.0)),
         TopOpt.NodalLoad("force", (0.0, -1.0)),
     ],
 )
 
-opts = TopOpt.OptimOpts(maxiter=100, volfrac=0.3, rρ=5.0, rθ=5.0, reltol=5e-4)
+opts = TopOpt.OptimOpts(maxiter=150, volfrac=0.4, rρ=10.0, rθ=10.0, reltol=5e-4)
 @time ρ, θ, c_hist, FS_hist, mode_hist, IFm, IFf = TopOpt.topopt(model, opts)
 
 # plot convergence
@@ -53,7 +54,7 @@ hidespines!(ax)
 
 centers = TopOpt.get_centers(model)
 GLMakie.arrows!(centers[:, 1], centers[:, 2], cos.(θ), sin.(θ),
-    arrowsize=0, lengthscale=1.5, align=:center, color=ρ, colormap=:binary)
+    arrowsize=0, lengthscale=3.0, align=:center, color=ρ, colormap=:binary)
 
 # matrix
 axm = Axis(f2[2, 1][1, 1][1, 1], aspect=DataAspect(), title="Matrix failure index")
@@ -71,6 +72,6 @@ hidespines!(axf)
 pf = cellplot!(plotter, IFf, colormap=:viridis)
 f2[2, 1][1, 2][2, 1] = GLMakie.Colorbar(f2[2, 1][1, 2][1, 1], pf, vertical=false)
 
-display(f2)
+wait(display(f2))
 
 nothing

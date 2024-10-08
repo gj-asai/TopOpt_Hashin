@@ -101,10 +101,9 @@ function FEModel(; mat::Material{dim}, grid::Grid, ip::Interpolation, qr::Quadra
     return FEModel(mat, grid, elemvol, constraints, loads, cellvalues, facevalues, dh, ch)
 end
 
-struct OptimOpts
+@kwdef struct OptimOpts
     maxiter::Integer
     volfrac::Real
-    p::Real
     rρ::Real
     rθ::Real
     reltol::Real
@@ -114,6 +113,7 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
     Hρ = convolution_filter(opts.rρ, model)
     Hθ = convolution_filter(opts.rθ, model)
     f = global_force(model)
+    penal = 1
 
     # preallocate stifness and sensitivities
     n_basefuncs = getnbasefunctions(model.cellvalues)
@@ -127,17 +127,16 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
     ∂c∂θ_prev = zeros(getncells(model.grid))
     function obj(x::AbstractVector)
         # regularise orientations
-        H = x[1:2:end]' .* Hθ # scale columns by density
-        H ./= sum(H, dims=2) # renormalize
-        x[2:2:end] .= Hθ * x[2:2:end] # apply filter
+        x[2:2:end] .= Hθ * x[2:2:end]
 
         # assemble linear system
-        global_stiffness!(K, ∂Ke∂x, x, opts.p, model)
+        global_stiffness!(K, ∂Ke∂x, x, penal, model)
         apply!(K, f, model.ch)
 
         # solve
         u .= K \ f
         c = u' * K * u
+
         return c
     end
     function dobj(x)
@@ -150,15 +149,6 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
 
         # filter densities
         ∂c∂x[1:2:end] .= Hρ * (x[1:2:end] .* ∂c∂x[1:2:end]) ./ x[1:2:end]
-
-        # regularise orientations
-        # H = x[1:2:end]' .* Hθ # scale columns by density
-        # H ./= sum(H, dims=2) # renormalize
-        # ∂c∂x[2:2:end] .= H * ∂c∂x[2:2:end] # apply filter
-
-        # average orientations
-        # ∂c∂x[2:2:end] .= 0.5 * (∂c∂x[2:2:end] + ∂c∂θ_prev)
-        # ∂c∂θ_prev .= ∂c∂x[2:2:end]
 
         return ∂c∂x
     end
@@ -191,7 +181,7 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
             for q_point in 1:getnquadpoints(model.cellvalues)
                 dΩ = getdetJdV(model.cellvalues, q_point)
                 ϵ = function_symmetric_gradient(model.cellvalues, q_point, u[celldofs(cell)])
-                σ[e] += ρ[e]^opts.p * rotate(model.mat.C, θ[e]) ⊡ ϵ * dΩ
+                σ[e] += ρ[e]^penal * rotate(model.mat.C, θ[e]) ⊡ ϵ * dΩ
             end
             σ[e] /= model.elemvol[e]
         end
@@ -203,10 +193,6 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
             e = cellid(cell)
             FS[e], mode[e], (IFm[e], IFf[e]) = hashin2d(σ[e], θ[e], model.mat)
         end
-
-        IFm .*= ρ .^ opts.p
-        IFf .*= ρ .^ opts.p
-        FS .*= ρ .^ opts.p
 
         crit = argmin(FS)
         FS = FS[crit]
@@ -224,26 +210,29 @@ function topopt(model::FEModel{dim}, opts::OptimOpts) where {dim}
     end
     add_ineq_constraint!(optim, CustomGradFunction(constraint, dconstraint))
 
-    r = optimize(
-        optim,
-        MMA(),
-        begin
-            x0 = zeros(2 * getncells(model.grid))
-            x0[1:2:end] .= opts.volfrac
-            x0[2:2:end] .= deg2rad(0)
-            x0
-        end,
-        options=MMAOptions(
-            maxiter=opts.maxiter,
-            convcriteria=GenericCriteria(),
-            tol=Tolerance(x=0.0, fabs=0.0, frel=opts.reltol),
-        ),
-        callback=post,
-    )
+    x = zeros(2 * getncells(model.grid))
+    x[1:2:end] .= opts.volfrac
+    x[2:2:end] .= deg2rad(0)
 
-    c = r.minimum
-    ρ = r.minimizer[1:2:end]
-    θ = r.minimizer[2:2:end]
+    while penal <= 3
+        r = optimize(
+            optim,
+            MMA(),
+            x,
+            options=MMAOptions(
+                maxiter=opts.maxiter,
+                convcriteria=GenericCriteria(),
+                tol=Tolerance(x=0.0, fabs=0.0, frel=opts.reltol),
+            ),
+            callback=post,
+        )
+
+        x .= r.minimizer
+        penal += 1
+    end
+
+    ρ = x[1:2:end]
+    θ = x[2:2:end]
 
     return ρ, θ, c_hist, FS_hist, mode_hist, IFm, IFf
 end
