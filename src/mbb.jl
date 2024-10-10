@@ -26,8 +26,8 @@ model = TopOpt.FEModel(
     ],
 )
 
-opts = TopOpt.OptimOpts(maxiter=100, volfrac=0.3, rρ=5.0, rθ=5.0, reltol=5e-4)
-@time ρ, θ, c_hist, FS_hist, mode_hist, IFm, IFf = TopOpt.topopt(model, opts)
+opts = TopOpt.OptimOpts(maxiter=200, volfrac=0.3, rρ=5.0, rθ=5.0, reltol=1e-4, objective=TopOpt.Compliance())
+@time ρ, θ, c_hist, IF_hist, IFm, IFf = TopOpt.topopt(model, opts)
 
 # plot convergence
 f1 = Figure()
@@ -36,9 +36,9 @@ ax1 = Axis(f1[1, 1], ylabel="Compliance (N.mm)",
     xtickalign=1, ytickalign=1, xticksmirrored=true, yticksmirrored=true)
 lines!(ax1, 0:length(c_hist)-1, c_hist)
 
-ax2 = Axis(f1[2, 1], ylabel="Failure load (N)", xlabel="Iteration",
+ax2 = Axis(f1[2, 1], ylabel="Failure index", xlabel="Iteration",
     xtickalign=1, ytickalign=1, xticksmirrored=true, yticksmirrored=true)
-lines!(ax2, 0:length(FS_hist)-1, FS_hist)
+lines!(ax2, 0:length(IF_hist)-1, IF_hist)
 
 wait(display(f1))
 
